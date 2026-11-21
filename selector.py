@@ -246,6 +246,41 @@ def apply_patch(old_text: str, fp: FilePatch) -> str:
 
 
 # --------------------------------------------------------------------------- maps
+class _LazySets:
+    """Test sets of the coverage map, translated to tests.json numbers on first use."""
+
+    def __init__(self, maps):
+        self.maps = maps
+        self.cache = {}
+
+    def __getitem__(self, i):
+        v = self.cache.get(i)
+        if v is None:
+            v = self.cache[i] = frozenset(self.maps._translate(self.maps._raw_sets[i]))
+        return v
+
+
+class _LazyDict:
+    def __init__(self, raw, translate):
+        self.raw, self.translate, self.cache = raw, translate, {}
+
+    def __contains__(self, k):
+        return k in self.raw
+
+    def get(self, k, default=None):
+        if k not in self.raw:
+            return default
+        if k not in self.cache:
+            self.cache[k] = self.translate(self.raw[k])
+        return self.cache[k]
+
+    def __getitem__(self, k):
+        v = self.get(k)
+        if v is None:
+            raise KeyError(k)
+        return v
+
+
 class Maps:
     def __init__(self, tests):
         self.tests = tests
@@ -258,22 +293,27 @@ class Maps:
         # translate map test index -> tests.json number by id
         idx_to_num = [self.by_id.get(tid) for tid in cov["tests"]]
         self.unmapped_tests = {n for n in self.all if n not in set(idx_to_num)}
-        self.sets = [frozenset(idx_to_num[i] for i in s if idx_to_num[i] is not None) for s in cov["sets"]]
+        self._raw_sets = cov["sets"]
+        self._idx = idx_to_num
+        self._identity = all(n == i for i, n in enumerate(idx_to_num))
+        self.sets = _LazySets(self)
         self.cov = {f: ({int(k): v for k, v in d["lines"].items()}, set(d["collect"]))
                     for f, d in cov["files"].items()}
-        self.class_users = {k: {idx_to_num[i] for i in v if idx_to_num[i] is not None}
-                            for k, v in cov.get("class_users", {}).items()}
+        self._class_users_raw = cov.get("class_users", {})
+        self.class_users = _LazyDict(self._class_users_raw, self._translate)
         self.class_used_at_collect = cov.get("classes_used_at_collect", {})
         self.imp = {f: (d.get("import_mods", []), {int(k): v for k, v in d.get("import_lines", {}).items()})
                     for f, d in cov["files"].items() if d.get("import_lines")}
         # fixture -> tests that opened it while running (audit hook); read at collection -> unknown
-        self.opened = {fx: {idx_to_num[i] for i in v if idx_to_num[i] is not None}
-                       for fx, v in cov.get("fixtures_opened", {}).items()}
+        self.opened = _LazyDict(cov.get("fixtures_opened", {}), self._translate)
         self.opened_at_collect = set(cov.get("fixtures_opened_at_collect", ()))
         struct = json.loads((HERE / "struct_map.json").read_text("utf-8"))
         self.struct = struct["files"]
         self.struct_opaque = struct.get("opaque_tests", [])
         self.attr_reads = struct.get("attr_reads", {})
+        self.enums = set(struct.get("enums", ()))
+        self.str_enums = set(struct.get("str_enums", ()))
+        self.enum_attrs = struct.get("enum_attrs", {})
         self.class_assigns = struct.get("class_assigns", {})
         self.importers = {}
         for f, d in self.struct.items():
@@ -283,6 +323,11 @@ class Maps:
             self.fixtures = json.loads((HERE / "fixture_map.json").read_text("utf-8"))["fixtures"]
         except Exception:
             self.fixtures = {}
+
+    def _translate(self, idxs):
+        if self._identity:
+            return set(idxs)
+        return {self._idx[i] for i in idxs if self._idx[i] is not None}
 
     def lines_tests(self, f, lines):
         m = self.cov.get(f)
@@ -478,6 +523,52 @@ def same_code(a, b):
     return True
 
 
+def _normalize_identity(tree, maps):
+    """Rewrite `a is b` / `a is not b` to `a == b` / `a != b` where the two are provably the same:
+    one side is None, or one side is a member E.M of a plain Enum, or of a str-Enum when the other
+    side is an attribute that only ever holds members of E. Works on a deep copy."""
+    t = tree  # a fresh parse owned by the caller
+    enums, str_enums, enum_attrs = maps.enums, maps.str_enums, maps.enum_attrs
+
+    def member_of(e):
+        if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name) and e.value.id in enums:
+            return e.value.id
+        if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Attribute) and e.value.attr in enums:
+            return e.value.attr
+        return None
+
+    def safe(a, b):
+        if any(isinstance(x, ast.Constant) and x.value is None for x in (a, b)):
+            return True
+        for m, other in ((member_of(a), b), (member_of(b), a)):
+            if m is None:
+                continue
+            if m not in str_enums:
+                return True
+            if member_of(other) == m:
+                return True
+            if isinstance(other, ast.Attribute) and enum_attrs.get(other.attr) == m:
+                return True
+        return False
+
+    for n in ast.walk(t):
+        if isinstance(n, ast.Compare) and len(n.ops) == 1 and safe(n.left, n.comparators[0]):
+            if isinstance(n.ops[0], ast.Is):
+                n.ops[0] = ast.Eq()
+            elif isinstance(n.ops[0], ast.IsNot):
+                n.ops[0] = ast.NotEq()
+    return t
+
+
+def equivalent_modules(old_tree, new_tree, maps):
+    try:
+        if not maps.enums and not maps.enum_attrs:
+            return False
+        return ast.dump(_normalize_identity(ast.parse(old_tree), maps)) ==             ast.dump(_normalize_identity(ast.parse(new_tree), maps))
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- per-file analysis
 def module_name(rel):
     mod = rel[:-3].replace("/", ".")
@@ -511,8 +602,13 @@ def analyze_py(rel, fp, maps, import_checks):
             return set(maps.by_file[rel])
         raise RunAll(f"syntax error in {rel}")
     tree = ast.parse(old_text)
-    if same_code(compile(old_text, rel, "exec", dont_inherit=True), new_code) or             ast.dump(tree) == ast.dump(ast.parse(new_text)):
+    new_tree = ast.parse(new_text)
+    if same_code(compile(old_text, rel, "exec", dont_inherit=True), new_code) or             ast.dump(tree) == ast.dump(new_tree):
         return set()  # only comments / blank lines / formatting changed: same program
+    changed_text = [t for h in fp.hunks for tag, t in h[2] if tag in "+-"]
+    if any(re.search(r"is|==|!=", t) for t in changed_text) and             equivalent_modules(old_text, new_text, maps):
+        _dbg(rel, 0, "equivalent (is/== on None or enum members)")
+        return set()
     removed, inserts = changed_positions(fp)
     nlines = old_text.count("\n") + 1
     selected = set()
@@ -709,6 +805,160 @@ def _run_import_child(patched: dict, modules=None):
     return None
 
 
+_SERVER = r"""
+import importlib, importlib.abc, importlib.util, io, json, os, pkgutil, sys
+src = sys.argv[1]
+sys.path.insert(0, src)
+real_out = sys.stdout
+sys.stdout = io.StringIO()
+pristine = []
+try:
+    import sqlglot
+    for m in sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")
+                    if not x.name.endswith("__main__")):
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            pristine.append(m)
+    ok = True
+except BaseException:
+    ok = False
+real_out.write("@@READY " + json.dumps({"ok": ok, "pristine": pristine}) + chr(10))
+real_out.flush()
+
+
+class _Patched(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def __init__(self, patched):
+        self.patched = patched
+
+    def find_spec(self, name, path=None, target=None):
+        if name not in self.patched:
+            return None
+        p = self.patched[name][0]
+        pkg = p.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            name, p, loader=self, submodule_search_locations=[os.path.dirname(p)] if pkg else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        p, text = self.patched[module.__name__]
+        exec(compile(text, p, "exec"), module.__dict__)
+
+
+for line in sys.stdin:
+    req = json.loads(line)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        fails = []
+        try:
+            patched = {n: (p, t) for n, p, t in req["patched"]}
+            names = set(req["modules"]) | set(patched)
+            # drop every sqlglot module: modules outside the static closure can still hold
+            # references to closure objects (lazy, string-based imports); stdlib stays warm
+            for n in [k for k in sys.modules if k == "sqlglot" or k.startswith("sqlglot.")]:
+                del sys.modules[n]
+            sys.meta_path.insert(0, _Patched(patched))
+            for m in sorted(names):
+                try:
+                    importlib.import_module(m)
+                except BaseException:
+                    fails.append(m)
+        except BaseException:
+            fails.append("<child error>")
+        os.write(w, json.dumps(fails).encode())
+        os._exit(0)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    real_out.write("@@R " + (data.decode() or "null") + chr(10))
+    real_out.flush()
+"""
+
+
+class _ForkServer:
+    """Linux only: one helper imports every pristine sqlglot module once, then forks per check and
+    re-imports just the patched modules and their importers (much cheaper than a fresh interpreter)."""
+
+    def __init__(self):
+        self.proc = None
+        self.failed = not hasattr(os, "fork")
+        self.pristine_fails = set()
+
+    def available(self):
+        return not self.failed
+
+    def _readline(self, timeout):
+        import threading
+        box = []
+
+        def rd():
+            while True:
+                l = self.proc.stdout.readline()
+                if not l or l.startswith("@@"):
+                    box.append(l)
+                    return
+
+        t = threading.Thread(target=rd, daemon=True)
+        t.start()
+        t.join(timeout)
+        return box[0] if box else None
+
+    def _start(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        self.proc = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", _SERVER, str(SRC)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     env=env, text=True, encoding="utf-8")
+        line = self._readline(60)
+        if not line or not line.startswith("@@READY "):
+            raise RuntimeError("fork server did not start")
+        info = json.loads(line[len("@@READY "):])
+        if not info.get("ok"):
+            raise RuntimeError("pinned sqlglot does not import")
+        self.pristine_fails = set(info.get("pristine", ()))
+
+    def check(self, patched, modules):
+        try:
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+            req = {"patched": [[module_name(rel), (SRC / rel).as_posix(), text] for rel, text in patched.items()],
+                   "modules": modules}
+            self.proc.stdin.write(json.dumps(req) + chr(10))
+            self.proc.stdin.flush()
+            line = self._readline(max(5.0, min(20.0, _DEADLINE[0] - time.monotonic())))
+            if not line or not line.startswith("@@R "):
+                raise RuntimeError("no answer")
+            res = json.loads(line[4:])
+            if res is None or "<child error>" in res:
+                raise RuntimeError("child error")
+            return set(res)
+        except Exception as e:
+            log(f"[selector] fork server unavailable: {e!r}")
+            self.failed = True
+            self.close()
+            return None
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            self.proc = None
+
+
+FORK_SERVER = _ForkServer()
+
+
 def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
     """True if `import sqlglot` and every sqlglot module still import with the patch applied
     (fresh interpreter; patched sources served by an import hook). Modules that fail to import
@@ -724,7 +974,18 @@ def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
                 if imp.startswith("sqlglot/") and imp not in seen:
                     seen.add(imp)
                     todo.append(imp)
-        modules = sorted({module_name(f) for f in seen if not f.endswith("__main__.py")})
+        modules = sorted({module_name(f) for f in seen | set(also) if f.startswith("sqlglot/")
+                          and not f.endswith("__main__.py")})
+    fails = None
+    if modules is not None and FORK_SERVER.available():
+        fails = FORK_SERVER.check(patched, modules)
+        if fails is not None and fails:
+            fails -= FORK_SERVER.pristine_fails
+            log(f"[selector] import check (fork): {sorted(fails)[:5] or 'ok'}")
+            return not fails
+        if fails is not None:
+            log("[selector] import check (fork): ok")
+            return True
     fails = _run_import_child(patched, modules)
     if fails is None:
         log("[selector] import check: no result (timeout / crash)")
@@ -741,6 +1002,9 @@ def select(patch_text, maps):
     files = parse_patch(patch_text)
     if not files:
         raise RunAll("no files in patch")
+    paths = [fp.path for fp in files]
+    if len(paths) != len(set(paths)) or len(paths) > 40:
+        raise RunAll("unusual patch (repeated or too many files)")
     selected = set()
     import_checks = {}
     for fp in files:
@@ -842,4 +1106,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        FORK_SERVER.close()
