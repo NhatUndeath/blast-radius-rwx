@@ -368,6 +368,15 @@ class Maps:
                 out |= self.file_tests(imp)
         return out
 
+    def replay(self):
+        if not hasattr(self, "_replay"):
+            try:
+                self._replay = json.loads(gzip.decompress((HERE / "replay_map.json.gz").read_bytes()))
+            except Exception as e:
+                log(f"[selector] no replay map: {e!r}")
+                self._replay = None
+        return self._replay
+
     def class_assign_names(self, f, line):
         for start, end, names in self.class_assigns.get(f, ()):
             if start <= line <= end:
@@ -624,9 +633,10 @@ def analyze_py(rel, fp, maps, import_checks):
             out |= maps.by_file.get(rel, set())
         return out
 
-    def class_level(cls, chain):
+    def class_level(cls, chain, family=True):
         out = maps.range_tests(rel, min([cls.lineno] + [d.lineno for d in cls.decorator_list]), cls.end_lineno)
-        out |= maps.family_tests(rel) if rel.startswith("sqlglot/") else set()
+        if family:
+            out |= maps.family_tests(rel) if rel.startswith("sqlglot/") else set()
         classes = [n for n in chain if isinstance(n, ast.ClassDef)]
         quals = []
         prefix = ""
@@ -640,7 +650,7 @@ def analyze_py(rel, fp, maps, import_checks):
             out |= maps.class_tests(rel, q)  # tests that instantiated it or a subclass (MRO)
             for ff, s, e in maps.subclass_ranges(q):
                 out |= maps.range_tests(ff, s, e)
-                if ff.startswith("sqlglot/"):
+                if family and ff.startswith("sqlglot/"):
                     out |= maps.family_tests(ff)
         if is_test_file:
             pre = f"{rel}::{cls.name}::"
@@ -665,6 +675,12 @@ def analyze_py(rel, fp, maps, import_checks):
                 if readers is not None:
                     _dbg(rel, line, f"class-attr {names}")
                     return broad & readers
+                if names and len([n for n in chain if isinstance(n, ast.ClassDef)]) == 1 and                         all(isinstance(n, ast.ClassDef) for n in chain):
+                    # attribute of a top-level class whose value is also consumed at import time
+                    # (metaclass, registries): affects the class's users and its subclasses' users,
+                    # not every test that touches the module
+                    _dbg(rel, line, f"class-attr-users {names}")
+                    return class_level(node, chain, family=False)
             _dbg(rel, line, "class")
             return broad
         fn = node
@@ -706,9 +722,12 @@ def analyze_py(rel, fp, maps, import_checks):
             out = module_level()
         if is_test_file:
             out |= _tests_in_fn(rel, chain, maps)
+        import_checks.setdefault("__spans__", []).append((rel, stmt_range.start, stmt_range.stop - 1))
         _dbg(rel, line, "stmt")
         return out
 
+    import_checks.setdefault("__lines__", []).extend((rel, ln) for ln in removed)
+    import_checks["__lines__"].extend((rel, ln) for a in inserts for ln in (a, a + 1))
     for line in sorted(removed):
         selected |= handle_line(line, False)
     for after in sorted(inserts):
@@ -1043,6 +1062,156 @@ def select(patch_text, maps):
     if selected:
         # tests the coverage map knows nothing about (e.g. could not run when the map was built)
         selected |= {n for n in maps.unmapped_tests if n in maps.all}
+        if all(fp.path.startswith("sqlglot/") or fp.path.startswith("tests/fixtures/") for fp in files):
+            selected = genmem_prune(selected, import_checks, maps)
+        replayable = (not import_checks.get("__need__") and all(
+            (fp.path.endswith(".py") and fp.path.startswith("sqlglot/"))
+            or (fp.path.startswith("tests/fixtures/") and "/tpc-" not in fp.path) for fp in files))
+        if replayable and import_checks.get("__spans__"):
+            selected = replay_prune(selected, import_checks.get("__patched__", {}),
+                                    import_checks["__spans__"], maps)
+    return selected
+
+
+_REPLAY_CHILD = r"""
+import importlib, importlib.abc, importlib.util, io, json, os, sys
+src, here = sys.argv[1], sys.argv[2]
+req = json.loads(sys.stdin.read())
+patched = {name: (path, text) for name, path, text in req["patched"]}
+
+
+class _Patched(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, name, path=None, target=None):
+        if name not in patched:
+            return None
+        p = patched[name][0]
+        pkg = p.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            name, p, loader=self, submodule_search_locations=[os.path.dirname(p)] if pkg else None)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        p, text = patched[module.__name__]
+        exec(compile(text, p, "exec"), module.__dict__)
+
+
+sys.meta_path.insert(0, _Patched())
+sys.path.insert(0, src)
+sys.path.insert(0, here)
+import replay_core
+sys.stdin = io.StringIO(json.dumps({k: v for k, v in req.items() if k != "patched"}))
+replay_core._check(src)
+"""
+
+# local CPU seconds recorded per query are ~3x the scorer's; replay only when it is clearly cheaper
+REPLAY_BUDGET_LOCAL_SEC = float(os.environ.get("REPLAY_BUDGET_LOCAL_SEC", "25"))
+TABLE_LOAD_LOCAL_SEC = 0.6
+
+
+GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+
+def _run_replay_child(req, timeout):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    try:
+        r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
+                           input=json.dumps(req), capture_output=True, text=True, encoding="utf-8",
+                           env=env, timeout=timeout)
+        return next((l for l in r.stdout.splitlines() if l.startswith("@@R ")), "@@R none")
+    except subprocess.TimeoutExpired:
+        return "@@R timeout"
+
+
+def genmem_prune(selected, import_checks, maps):
+    """test_generator_memory only builds every dialect's generator (and checks it does not leak).
+    When it is selected because a dialect's classes changed (not because the changed lines run
+    during construction), re-run its loop for just the dialects built from patched modules."""
+    tnum = maps.by_id.get(GENMEM_ID)
+    patched = import_checks.get("__patched__", {})
+    if tnum is None or tnum not in selected or not patched:
+        return selected
+    saving = _cost_ms(selected, maps.dur) - _cost_ms(selected - {tnum}, maps.dur)
+    if saving < 2500:
+        return selected
+    spans = import_checks.get("__spans__", [])
+    for rel, ln in import_checks.get("__lines__", []):
+        if tnum in maps.lines_tests(rel, [ln]):
+            return selected  # the change runs while generators are built: keep the real test
+    for rel, s, e in spans:
+        if tnum in maps.lines_tests(rel, range(s, e + 1)):
+            return selected
+    if time.monotonic() + 30 > _DEADLINE[0]:
+        return selected
+    req = {"patched": [[module_name(r), (SRC / r).as_posix(), t] for r, t in patched.items()],
+           "genmem": {"modules": sorted(module_name(r) for r in patched), "max": 6}}
+    verdict = _run_replay_child(req, max(5.0, min(60.0, _DEADLINE[0] - time.monotonic() - 10)))
+    log(f"[selector] replay generator_memory -> {verdict[4:]}")
+    return selected - {tnum} if verdict == "@@R same" else selected
+
+
+def _cost_ms(selected, dur):
+    workers = schedule(selected, dur)
+    if not workers:
+        return 0
+    return max(sum(dur[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)
+
+
+def replay_prune(selected, patched, spans, maps):
+    """Drop test_execute_tpch / test_execute_tpcds when re-running just the queries whose recorded
+    coverage touches the changed statements gives the pristine results with the patched code."""
+    rmap = maps.replay()
+    if not rmap:
+        return selected
+    by_file = {}
+    for rel, s, e in spans:
+        by_file.setdefault(rel, []).append((s, e))
+    dur = maps.dur
+    for kind, info in sorted(rmap.items(), key=lambda kv: -dur.get(maps.by_id.get(kv[1]["test"]), 0)):
+        tnum = maps.by_id.get(info["test"])
+        if tnum is None or tnum not in selected:
+            continue
+        saving_ms = _cost_ms(selected, dur) - _cost_ms(selected - {tnum}, dur)
+        affected, seconds, tables = [], 0.0, set()
+        for q in info["queries"]:
+            hit = False
+            for rel, rngs in by_file.items():
+                ls = set(q["files"].get(rel, ())) | set(q["setup"].get(rel, ()))
+                if any(s <= ln <= e for ln in ls for s, e in rngs):
+                    hit = True
+                    break
+            if hit:
+                affected.append(q)
+                seconds += q["seconds"]
+                tables |= set(q.get("tables", ()))
+        est = seconds + TABLE_LOAD_LOCAL_SEC * len(tables)
+        # scorer CPU is ~1/3 of these local seconds, plus ~1 s to start a patched interpreter
+        if est / 3 + 1.0 > saving_ms / 1000 * 0.7:
+            log(f"[selector] replay {kind}: saving {saving_ms / 1000:.1f}s < cost est {est / 3 + 1:.1f}s, keep")
+            continue
+        if est > REPLAY_BUDGET_LOCAL_SEC:
+            log(f"[selector] replay {kind}: {len(affected)} queries, est {est:.1f}s local: too costly, keep")
+            continue
+        if time.monotonic() + 30 > _DEADLINE[0]:
+            continue
+        if affected:
+            req = {"patched": [[module_name(r), (SRC / r).as_posix(), t] for r, t in patched.items()],
+                   "queries": {kind: [[q["i"], {"duckdb_sql": q["duckdb_sql"], "result": q["result"]}]
+                                      for q in affected]}}
+            env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+            try:
+                r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
+                                   input=json.dumps(req), capture_output=True, text=True, encoding="utf-8",
+                                   env=env, timeout=max(5.0, min(60.0, _DEADLINE[0] - time.monotonic() - 10)))
+                verdict = next((l for l in r.stdout.splitlines() if l.startswith("@@R ")), "@@R none")
+            except subprocess.TimeoutExpired:
+                verdict = "@@R timeout"
+        else:
+            verdict = "@@R same"
+        log(f"[selector] replay {kind}: {len(affected)} queries -> {verdict[4:]}")
+        if verdict == "@@R same":
+            selected = selected - {tnum}
     return selected
 
 
@@ -1074,6 +1243,7 @@ def main() -> None:
         if not (SRC / "sqlglot" / "__init__.py").is_file():
             raise RuntimeError(f"pinned sqlglot sources not found at {SRC}")
         maps = Maps(tests)
+        maps.dur = dur
     except Exception as e:
         log(f"[selector] maps unavailable, running everything: {e!r}")
         maps = None
