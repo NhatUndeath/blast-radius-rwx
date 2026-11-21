@@ -240,7 +240,9 @@ def _genmem(spec):
 
     patched = set(spec["modules"])
     affected = []
-    for name in Dialects:
+    candidates = spec.get("names")
+    names = list(Dialects) if candidates is None else list(candidates)
+    for name in names:
         try:
             cls = type(Dialect.get_or_raise(name))
             mods = {c.__module__ for k in (cls, cls.generator_class, cls.tokenizer_class, cls.parser_class)

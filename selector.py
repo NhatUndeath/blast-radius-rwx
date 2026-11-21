@@ -310,6 +310,7 @@ class Maps:
         struct = json.loads((HERE / "struct_map.json").read_text("utf-8"))
         self.struct = struct["files"]
         self.struct_opaque = struct.get("opaque_tests", [])
+        self.opaque_info = struct.get("opaque_info", {})
         self.attr_reads = struct.get("attr_reads", {})
         self.enums = set(struct.get("enums", ()))
         self.str_enums = set(struct.get("str_enums", ()))
@@ -829,6 +830,11 @@ sys.stdout = io.StringIO()
 failed = []
 try:
     import sqlglot
+    try:
+        if len(sqlglot.Dialect._classes) != 1:  # what tests/dialects/test_dialect.py::test_lazy_load checks
+            failed.append("<lazy>")
+    except Exception:
+        failed.append("<lazy>")
     import pkgutil
     names = req.get("modules") or sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")
                                          if not m.name.endswith("__main__"))
@@ -874,6 +880,11 @@ sys.stdout = io.StringIO()
 pristine = []
 try:
     import sqlglot
+    try:
+        if len(sqlglot.Dialect._classes) != 1:
+            pristine.append("<lazy>")
+    except Exception:
+        pristine.append("<lazy>")
     for m in sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")
                     if not x.name.endswith("__main__")):
         try:
@@ -922,6 +933,12 @@ for line in sys.stdin:
             for n in [k for k in sys.modules if k == "sqlglot" or k.startswith("sqlglot.")]:
                 del sys.modules[n]
             sys.meta_path.insert(0, _Patched(patched))
+            try:
+                sg = importlib.import_module("sqlglot")
+                if len(sg.Dialect._classes) != 1:
+                    fails.append("<lazy>")
+            except BaseException:
+                fails.append("<lazy>")
             for m in sorted(names):
                 try:
                     importlib.import_module(m)
@@ -1019,6 +1036,9 @@ class _ForkServer:
 FORK_SERVER = _ForkServer()
 
 
+LAZY_OK = [False]
+
+
 def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
     """True if `import sqlglot` and every sqlglot module still import with the patch applied
     (fresh interpreter; patched sources served by an import hook). Modules that fail to import
@@ -1036,17 +1056,19 @@ def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
                     todo.append(imp)
         modules = sorted({module_name(f) for f in seen | set(also) if f.startswith("sqlglot/")
                           and not f.endswith("__main__.py")})
+    LAZY_OK[0] = False
     fails = None
     if modules is not None and FORK_SERVER.available():
         fails = FORK_SERVER.check(patched, modules)
-        if fails is not None and fails:
-            fails -= FORK_SERVER.pristine_fails
+        if fails is not None:
+            LAZY_OK[0] = "<lazy>" not in fails and "<lazy>" not in FORK_SERVER.pristine_fails
+            fails = set(fails) - FORK_SERVER.pristine_fails - {"<lazy>"}
             log(f"[selector] import check (fork): {sorted(fails)[:5] or 'ok'}")
             return not fails
-        if fails is not None:
-            log("[selector] import check (fork): ok")
-            return True
     fails = _run_import_child(patched, modules)
+    if fails is not None:
+        LAZY_OK[0] = "<lazy>" not in fails
+        fails = set(fails) - {"<lazy>"}
     if fails is None:
         log("[selector] import check: no result (timeout / crash)")
         return False
@@ -1090,16 +1112,23 @@ def select(patch_text, maps):
             continue
         else:
             raise RunAll(f"unhandled file {rel}")
+    if import_checks.get("__need__") and not import_check(import_checks["__patched__"],
+                                                         import_checks.get("__also__", set()), maps):
+        raise RunAll("patched modules fail to import")
     if import_checks.get("__need__"):
-        # tests that run sqlglot out of process (e.g. `python -c "import sqlglot"`) see import-time changes
+        # tests that run sqlglot out of process or enumerate packages: line coverage cannot see them
+        changed_paths = [fp.path for fp in files]
         for entry in maps.struct_opaque:
+            info = maps.opaque_info.get(entry, {})
+            if info.get("enumerates") and info.get("pkgs"):
+                if not any(p.startswith(pk) for p in changed_paths for pk in info["pkgs"]):
+                    continue  # enumerates only packages this patch does not touch
+            elif entry in maps.opaque_info and LAZY_OK[0]:
+                continue  # the import check reproduced its `import sqlglot` and it still holds
             if entry in maps.by_id:
                 selected.add(maps.by_id[entry])
             else:
                 selected |= maps.by_file.get(entry, set())
-    if import_checks.get("__need__") and not import_check(import_checks["__patched__"],
-                                                         import_checks.get("__also__", set()), maps):
-        raise RunAll("patched modules fail to import")
     if selected:
         # tests the coverage map knows nothing about (e.g. could not run when the map was built)
         selected |= {n for n in maps.unmapped_tests if n in maps.all}
@@ -1185,8 +1214,29 @@ def genmem_prune(selected, import_checks, maps):
             return selected
     if time.monotonic() + 30 > _DEADLINE[0]:
         return selected
+    # candidate dialects from the files involved (patched files and files subclassing their
+    # classes): dialects/<d>.py, parsers/<d>.py, generators/<d>.py, ... ; anything else (core
+    # modules every dialect inherits from) makes the check as costly as the test itself
+    files = set(patched)
+    for rel in patched:
+        for c in maps.struct.get(rel, {}).get("classes", ()):
+            for ff, _s, _e in maps.subclass_ranges(c.get("qual", c["name"])):
+                files.add(ff)
+    names = set()
+    for f in files:
+        parts = f.split("/")
+        if len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "parsers", "generators",
+                                                                       "tokenizers", "typing"):
+            stem = parts[2][:-3]
+            if stem in ("__init__", "dialect", "base") or f"sqlglot/dialects/{stem}.py" not in maps.struct:
+                return selected  # shared by every dialect: as costly as the real test
+            names.add(stem)
+        else:
+            return selected
+    if not names or len(names) > 6:
+        return selected
     req = {"patched": [[module_name(r), (SRC / r).as_posix(), t] for r, t in patched.items()],
-           "genmem": {"modules": sorted(module_name(r) for r in patched), "max": 6}}
+           "genmem": {"modules": sorted(module_name(r) for r in patched), "names": sorted(names), "max": 6}}
     verdict = _run_replay_child(req, max(5.0, min(60.0, _DEADLINE[0] - time.monotonic() - 10)))
     log(f"[selector] replay generator_memory -> {verdict[4:]}")
     return selected - {tnum} if verdict == "@@R same" else selected
