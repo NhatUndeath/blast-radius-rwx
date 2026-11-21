@@ -48,6 +48,11 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _dbg(rel, line, rule):
+    if os.environ.get("SELECTOR_DEBUG"):
+        log(f"[rule] {rel}:{line} {rule}")
+
+
 class RunAll(Exception):
     pass
 
@@ -186,21 +191,34 @@ def parse_patch(text: str) -> list[FilePatch]:
 
 
 def changed_positions(fp: FilePatch):
-    """removed: old line numbers removed/modified; inserts: old line numbers after which lines are added."""
+    """removed: old line numbers removed/modified; inserts: old line numbers after which lines are
+    added. A block of '-' lines followed by as many or fewer '+' lines is a replacement and is
+    analysed through its removed lines only; extra '+' lines count as an insertion."""
     removed, inserts = set(), set()
     for old_start, _old_len, body in fp.hunks:
-        ln = old_start if old_start > 0 else 0
-        # old_start is the first old line of the hunk (or the line before, when old_len == 0)
-        if _old_len == 0:
-            ln = old_start + 1
+        ln = old_start + 1 if _old_len == 0 else old_start
+        minus = plus = 0
+        last_removed = None
+
+        def close_block():
+            if plus > minus:
+                inserts.add(ln - 1)  # added after old line ln-1
+
         for tag, _ in body:
             if tag == " ":
+                close_block()
+                minus = plus = 0
                 ln += 1
             elif tag == "-":
+                if plus:  # '-' after '+': new block
+                    close_block()
+                    minus = plus = 0
                 removed.add(ln)
+                minus += 1
                 ln += 1
             elif tag == "+":
-                inserts.add(ln - 1)  # added after old line ln-1
+                plus += 1
+        close_block()
     return removed, inserts
 
 
@@ -255,6 +273,8 @@ class Maps:
         struct = json.loads((HERE / "struct_map.json").read_text("utf-8"))
         self.struct = struct["files"]
         self.struct_opaque = struct.get("opaque_tests", [])
+        self.attr_reads = struct.get("attr_reads", {})
+        self.class_assigns = struct.get("class_assigns", {})
         self.importers = {}
         for f, d in self.struct.items():
             for imp in d["imports"]:
@@ -301,6 +321,38 @@ class Maps:
         for imp in self.struct.get(f, {}).get("imports", ()):
             if imp.startswith("sqlglot/") and len(self.importers.get(imp, ())) <= 3:
                 out |= self.file_tests(imp)
+        return out
+
+    def class_assign_names(self, f, line):
+        for start, end, names in self.class_assigns.get(f, ()):
+            if start <= line <= end:
+                return names
+        return None
+
+    def attr_read_tests(self, names):
+        """Tests that execute a read of any of these class attributes at run time, following
+        class-body assignments that copy them (KEYWORDS = {**Base.KEYWORDS, ...}). None when a read
+        happens at import time (the value is baked in somewhere) or a name has no read site."""
+        seen, work, out = set(names), list(names), set()
+        while work:
+            if len(seen) > 300:
+                return None
+            name = work.pop()
+            sites = self.attr_reads.get(name)
+            if not sites:
+                return None
+            for f, s, e in sites:
+                names2 = self.class_assign_names(f, s)
+                if names2 is not None:
+                    for n2 in names2:
+                        if n2 not in seen:
+                            seen.add(n2)
+                            work.append(n2)
+                    continue
+                span = range(s, e + 1)
+                if self.collected(f, span) or self.import_mods(f, span):
+                    return None
+                out |= self.lines_tests(f, span)
         return out
 
     def class_tests(self, f, qual):
@@ -505,15 +557,25 @@ def analyze_py(rel, fp, maps, import_checks):
         fns = [n for n in chain if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         if not chain:
             need_import_check = True
+            _dbg(rel, line, "module")
             return module_level()
         node = chain[-1]
         if isinstance(node, ast.ClassDef):
             need_import_check = True
-            return class_level(node, chain)
+            broad = class_level(node, chain)
+            if not inserted and rel.startswith("sqlglot/"):
+                names = maps.class_assign_names(rel, line)
+                readers = maps.attr_read_tests(names) if names else None
+                if readers is not None:
+                    _dbg(rel, line, f"class-attr {names}")
+                    return broad & readers
+            _dbg(rel, line, "class")
+            return broad
         fn = node
         out = set()
         if any(is_cached(f) for f in fns):
             need_import_check = True
+            _dbg(rel, line, "module")
             return module_level()
         if line < body_start(fn) or (inserted and line == fn.end_lineno and line == body_start(fn)):
             # decorator / signature / def line: anything using the function
@@ -524,6 +586,7 @@ def analyze_py(rel, fp, maps, import_checks):
                 out |= class_level(chain[idx], chain[: idx + 1])  # renamed / new method changes dispatch
             if is_test_file:
                 out |= _tests_in_fn(rel, chain, maps)
+            _dbg(rel, line, "defline")
             return out
         stmt = innermost_stmt(fn, line)
         lines = list(header_lines(stmt)) if stmt is not None else [line]
@@ -540,12 +603,14 @@ def analyze_py(rel, fp, maps, import_checks):
             if mods:
                 need_import_check = True  # the change runs during those imports: they may now fail
                 import_checks.setdefault("__also__", set()).update(mods)
-        if not out and maps.collected(rel, range(fn.lineno, fn.end_lineno + 1)):
+        stmt_range = range(stmt.lineno, stmt.end_lineno + 1) if stmt is not None else range(line, line + 1)
+        if not out and maps.collected(rel, stmt_range):
             # runs at import / collection time only: static
             need_import_check = True
             out = module_level()
         if is_test_file:
             out |= _tests_in_fn(rel, chain, maps)
+        _dbg(rel, line, "stmt")
         return out
 
     for line in sorted(removed):
@@ -609,8 +674,8 @@ failed = []
 try:
     import sqlglot
     import pkgutil
-    names = sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")
-                   if not m.name.endswith("__main__"))
+    names = req.get("modules") or sorted(m.name for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.")
+                                         if not m.name.endswith("__main__"))
 except BaseException as e:
     failed = ["sqlglot"]
     names = []
@@ -628,8 +693,9 @@ _PRISTINE_FAILS: list = []
 _DEADLINE = [float("inf")]
 
 
-def _run_import_child(patched: dict):
-    req = {"patched": [[module_name(rel), (SRC / rel).as_posix(), text] for rel, text in patched.items()]}
+def _run_import_child(patched: dict, modules=None):
+    req = {"patched": [[module_name(rel), (SRC / rel).as_posix(), text] for rel, text in patched.items()],
+           "modules": modules}
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     try:
         r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _CHILD, str(SRC)], input=json.dumps(req),
@@ -643,11 +709,23 @@ def _run_import_child(patched: dict):
     return None
 
 
-def import_check(patched: dict, also: set = frozenset()) -> bool:
+def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
     """True if `import sqlglot` and every sqlglot module still import with the patch applied
     (fresh interpreter; patched sources served by an import hook). Modules that fail to import
     unpatched too (optional dependencies) are ignored."""
-    fails = _run_import_child(patched)
+    modules = None
+    if maps is not None:
+        # only modules that (transitively) import a patched / affected module can break
+        todo = [f for f in set(patched) | set(also) if f.startswith("sqlglot/")]
+        seen = set(todo)
+        while todo:
+            f = todo.pop()
+            for imp in maps.importers.get(f, ()):
+                if imp.startswith("sqlglot/") and imp not in seen:
+                    seen.add(imp)
+                    todo.append(imp)
+        modules = sorted({module_name(f) for f in seen if not f.endswith("__main__.py")})
+    fails = _run_import_child(patched, modules)
     if fails is None:
         log("[selector] import check: no result (timeout / crash)")
         return False
@@ -696,7 +774,7 @@ def select(patch_text, maps):
             else:
                 selected |= maps.by_file.get(entry, set())
     if import_checks.get("__need__") and not import_check(import_checks["__patched__"],
-                                                         import_checks.get("__also__", set())):
+                                                         import_checks.get("__also__", set()), maps):
         raise RunAll("patched modules fail to import")
     if selected:
         # tests the coverage map knows nothing about (e.g. could not run when the map was built)
