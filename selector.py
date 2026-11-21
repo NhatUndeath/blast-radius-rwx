@@ -1158,6 +1158,9 @@ def _cost_ms(selected, dur):
     return max(sum(dur[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)
 
 
+_REPLAY_ENV_BAD: list = []
+
+
 def replay_prune(selected, patched, spans, maps):
     """Drop test_execute_tpch / test_execute_tpcds when re-running just the queries whose recorded
     coverage touches the changed statements gives the pristine results with the patched code."""
@@ -1174,16 +1177,25 @@ def replay_prune(selected, patched, spans, maps):
             continue
         saving_ms = _cost_ms(selected, dur) - _cost_ms(selected - {tnum}, dur)
         affected, seconds, tables = [], 0.0, set()
-        for q in info["queries"]:
-            hit = False
+
+        def touches(q, field):
             for rel, rngs in by_file.items():
-                ls = set(q["files"].get(rel, ())) | set(q["setup"].get(rel, ()))
-                if any(s <= ln <= e for ln in ls for s, e in rngs):
-                    hit = True
-                    break
-            if hit:
-                affected.append(q)
-                seconds += q["seconds"]
+                if any(s <= ln <= e for ln in q.get(field, {}).get(rel, ()) for s, e in rngs):
+                    return True
+            return False
+
+        for q in info["queries"]:
+            if touches(q, "exec_files") or touches(q, "setup"):
+                mode = "full"  # the Python executor itself (or the table data) changes
+            elif touches(q, "files"):
+                mode = "plan"  # only parse / optimize / plan: comparing the plan is enough
+            else:
+                continue
+            if mode == "plan" and not q.get("plan") and q.get("execute"):
+                mode = "full"
+            affected.append((q, mode))
+            seconds += q["seconds"] if mode == "full" else q.get("plan_seconds", q["seconds"])
+            if q.get("execute"):
                 tables |= set(q.get("tables", ()))
         est = seconds + TABLE_LOAD_LOCAL_SEC * len(tables)
         # scorer CPU is ~1/3 of these local seconds, plus ~1 s to start a patched interpreter
@@ -1195,10 +1207,21 @@ def replay_prune(selected, patched, spans, maps):
             continue
         if time.monotonic() + 30 > _DEADLINE[0]:
             continue
+        if affected and _REPLAY_ENV_BAD:
+            continue
         if affected:
+            # calibration: one unaffected query first; if even that differs, the recorded hashes do
+            # not reproduce in this environment and replay is switched off for the rest of the run
+            hit = {q["i"] for q, _ in affected}
+            calib = min((q for q in info["queries"] if q["i"] not in hit and q.get("execute") and q.get("plan")),
+                        key=lambda q: q.get("plan_seconds", 9e9), default=None)
+            items = []
+            if calib is not None:
+                items.append([calib["i"], {"duckdb_sql": calib["duckdb_sql"], "plan": calib["plan"]}, "plan"])
+            items += [[q["i"], {"duckdb_sql": q["duckdb_sql"], "result": q["result"], "plan": q.get("plan")}, mode]
+                      for q, mode in affected]
             req = {"patched": [[module_name(r), (SRC / r).as_posix(), t] for r, t in patched.items()],
-                   "queries": {kind: [[q["i"], {"duckdb_sql": q["duckdb_sql"], "result": q["result"]}]
-                                      for q in affected]}}
+                   "queries": {kind: items}}
             env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
             try:
                 r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
@@ -1210,6 +1233,9 @@ def replay_prune(selected, patched, spans, maps):
         else:
             verdict = "@@R same"
         log(f"[selector] replay {kind}: {len(affected)} queries -> {verdict[4:]}")
+        if affected and calib is not None and verdict.startswith(f"@@R diff {kind} {calib['i']}:"):
+            _REPLAY_ENV_BAD.append(True)
+            log("[selector] replay calibration query differs: replay disabled")
         if verdict == "@@R same":
             selected = selected - {tnum}
     return selected

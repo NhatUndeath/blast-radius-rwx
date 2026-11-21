@@ -70,10 +70,66 @@ def _h(obj) -> str:
     return hashlib.sha256(repr(obj).encode()).hexdigest()[:24]
 
 
-def run_query(src, kind, meta, sql, tables_cache):
-    """What the test does for one query; returns comparable hashes (raises on errors)."""
+class _StopAfterPlan(Exception):
+    pass
+
+
+# phase switch for recording: "query" (parse, optimize, plan), "fp" (our fingerprint), "exec"
+PHASE = ["query"]
+
+
+def plan_fingerprint(plan) -> str:
+    """Everything the Python executor consumes from a plan: every step's attributes, with
+    expressions serialized by sqlglot's serde (types included) and steps referenced by id."""
+    from sqlglot import exp, serde
+    from sqlglot.planner import Step
+
+    labels = {}
+
+    def key(st):
+        return (type(st).__name__, str(st.name), repr([str(p) for p in getattr(st, "projections", [])]))
+
+    def visit(st):
+        if id(st) in labels:
+            return
+        labels[id(st)] = f"{type(st).__name__}#{len(labels)}"
+        for d in sorted(st.dependencies, key=key):
+            visit(d)
+
+    visit(plan.root)
+
+    def enc(o):
+        if isinstance(o, Step):
+            return ("step", labels.get(id(o), "?"))
+        if isinstance(o, exp.Expr):
+            return ("expr", json.dumps(serde.dump(o), sort_keys=True, default=repr))
+        if isinstance(o, dict):
+            return ("dict", sorted((repr(enc(k)), repr(enc(v))) for k, v in o.items()))
+        if isinstance(o, (list, tuple)):
+            return (type(o).__name__, [enc(x) for x in o])
+        if isinstance(o, (set, frozenset)):
+            return ("set", sorted(repr(enc(x)) for x in o))
+        if isinstance(o, (str, int, float, bool, type(None))):
+            return o
+        return ("obj", type(o).__name__)
+
+    rows = []
+    for st in sorted(plan.dag, key=lambda x: labels.get(id(x), "?")):
+        attrs = {k: v for k, v in vars(st).items() if k not in ("dependents", "dependencies")}
+        rows.append((labels.get(id(st), "?"), sorted((k, repr(enc(v))) for k, v in attrs.items()),
+                     sorted(labels.get(id(d), "?") for d in st.dependencies)))
+    rows.append(("expression", enc(plan.expression)))
+    return _h(rows)
+
+
+def run_query(src, kind, meta, sql, tables_cache, mode="full", timing=None):
+    """What the test does for one query; returns comparable hashes (raises on errors).
+    mode="plan" stops right before the Python executor runs the plan."""
+    import time
+
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
+    from sqlglot.executor.python import PythonExecutor
 
     expression = pickle.loads(pickle.dumps(parse_one(sql)))
     out = {"duckdb_sql": _h(transpile(sql, write="duckdb")[0])}
@@ -85,9 +141,31 @@ def run_query(src, kind, meta, sql, tables_cache):
             if name not in tables_cache:
                 tables_cache[name] = load_table(src, kind, name, sch[name])
             tables[name] = tables_cache[name]
-        result = execute(expression, schema=sch, tables=tables)
-        result = pickle.loads(pickle.dumps(result))
-        out["result"] = _h((list(result.columns), list(result.rows)))
+        orig = PythonExecutor.execute
+
+        def hooked(self, plan):
+            if timing is not None:
+                timing["plan_done"] = time.process_time()
+            PHASE[0] = "fp"
+            try:
+                out["plan"] = plan_fingerprint(plan)
+            finally:
+                PHASE[0] = "exec"
+            if mode == "plan":
+                raise _StopAfterPlan
+            return orig(self, plan)
+
+        PythonExecutor.execute = hooked
+        try:
+            result = execute(expression, schema=sch, tables=tables)
+            PHASE[0] = "query"
+            result = pickle.loads(pickle.dumps(result))
+            out["result"] = _h((list(result.columns), list(result.rows)))
+        except _StopAfterPlan:
+            pass
+        finally:
+            PythonExecutor.execute = orig
+            PHASE[0] = "query"
     return out
 
 
@@ -99,6 +177,7 @@ def _record(kind, i, src):
     tool = mon.COVERAGE_ID
     root = os.path.abspath(os.path.join(src, "sqlglot")) + os.sep
     lines: dict[str, set[int]] = {}
+    exec_lines: dict[str, set[int]] = {}
     phase = ["setup"]
     setup_lines: dict[str, set[int]] = {}
 
@@ -106,8 +185,16 @@ def _record(kind, i, src):
         f = code.co_filename
         if not os.path.abspath(f).startswith(root):
             return mon.DISABLE
+        if phase[0] == "query" and PHASE[0] == "fp":
+            return None  # our fingerprint code is not part of the test; keep the event enabled
         rel = os.path.relpath(os.path.abspath(f), src).replace(os.sep, "/")
-        (lines if phase[0] == "query" else setup_lines).setdefault(rel, set()).add(line)
+        if phase[0] == "setup":
+            target = setup_lines
+        elif PHASE[0] == "exec":
+            target = exec_lines
+        else:
+            target = lines
+        target.setdefault(rel, set()).add(line)
         return mon.DISABLE
 
     mon.use_tool_id(tool, "replay")
@@ -127,10 +214,13 @@ def _record(kind, i, src):
     mon.restart_events()
     phase[0] = "query"
     t0 = time.process_time()
-    out = run_query(src, kind, meta, sql, cache)
+    timing = {}
+    out = run_query(src, kind, meta, sql, cache, timing=timing)
     out["seconds"] = round(time.process_time() - t0, 3)
+    out["plan_seconds"] = round(timing.get("plan_done", time.process_time()) - t0, 3)
     mon.set_events(tool, 0)
     out["lines"] = {f: sorted(v) for f, v in lines.items()}
+    out["exec_lines"] = {f: sorted(v) for f, v in exec_lines.items()}
     out["setup_lines"] = {f: sorted(v) for f, v in setup_lines.items()}
     out["execute"] = bool(meta.get("execute"))
     out["tables"] = sorted(cache)
@@ -185,27 +275,34 @@ def _check(src):
     req = json.loads(sys.stdin.read())
     real_out = sys.stdout
     sys.stdout = open(os.devnull, "w")
+
+    def say(msg):
+        real_out.write("@@R " + msg + chr(10))
+
     try:
         if req.get("genmem"):
             verdict = _genmem(req["genmem"])
             if verdict != "same":
-                real_out.write(f"@@R {verdict}" + chr(10))
+                say(verdict)
                 return
         cache = {}
         for kind, items in req.get("queries", {}).items():
             qs = queries(src, kind)
-            for i, expected in items:
+            for item in items:
+                i, expected = item[0], item[1]
+                mode = item[2] if len(item) > 2 else "full"
                 meta, sql, _ = qs[i]
                 try:
-                    got = run_query(src, kind, meta, sql, cache)
+                    got = run_query(src, kind, meta, sql, cache, mode=mode)
                 except BaseException as e:  # noqa: BLE001
-                    real_out.write(f"@@R diff {kind} {i}: {type(e).__name__}\n")
+                    say(f"diff {kind} {i}: {type(e).__name__}")
                     return
-                for k in ("duckdb_sql", "result"):
+                keys = ("duckdb_sql", "plan") if mode == "plan" else ("duckdb_sql", "plan", "result")
+                for k in keys:
                     if expected.get(k) != got.get(k):
-                        real_out.write(f"@@R diff {kind} {i}: {k}\n")
+                        say(f"diff {kind} {i}: {k}")
                         return
-        real_out.write("@@R same\n")
+        say("same")
     finally:
         real_out.flush()
 
