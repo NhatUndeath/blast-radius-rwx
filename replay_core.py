@@ -139,6 +139,12 @@ def run_query(src, kind, meta, sql, tables_cache, mode="full", timing=None):
         tables = {}
         for t in find_tables(expression):
             name = t.name
+            if mode == "plan":
+                # the plan only depends on the schema: skip reading the CSV data
+                from sqlglot.executor.table import Table
+
+                tables[name] = Table(columns=sch[name], rows=[])
+                continue
             if name not in tables_cache:
                 tables_cache[name] = load_table(src, kind, name, sch[name])
             tables[name] = tables_cache[name]
@@ -349,8 +355,33 @@ def _check(src):
         real_out.flush()
 
 
+def _warm(kind, src):
+    """Per-query CPU of plan-only and full replays in one warm process (what a replay costs)."""
+    import time
+
+    sys.path.insert(0, src)
+    qs = queries(src, kind)
+    cache, out = {}, {}
+    for i, (meta, sql, _) in enumerate(qs):  # warm-up pass
+        run_query(src, kind, meta, sql, cache, mode="plan")
+    for i, (meta, sql, _) in enumerate(qs):
+        t = time.process_time()
+        run_query(src, kind, meta, sql, cache, mode="plan")
+        p = time.process_time() - t
+        t = time.process_time()
+        run_query(src, kind, meta, sql, {} if False else cache, mode="full")
+        out[i] = {"plan_warm": round(p, 4), "full_warm": round(time.process_time() - t, 4)}
+    t = time.process_time()
+    for name, columns in schema(kind).items():
+        load_table(src, kind, name, columns)
+    out["load_all_tables"] = round(time.process_time() - t, 3)
+    print(json.dumps(out))
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "record":
+    if sys.argv[1] == "warm":
+        _warm(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "record":
         _record(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     elif sys.argv[1] == "check":
         _check(sys.argv[2])

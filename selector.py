@@ -570,11 +570,23 @@ def _normalize_identity(tree, maps):
     return t
 
 
-def lambda_only_change(old_text, new_text):
-    """If old and new differ only inside lambda bodies, return the old line spans of the lambdas
-    whose body changed (their code runs when called, so line coverage of the body is exact)."""
+def _drop_bare_strings(tree):
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        keep_first = isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        new_body = [st for i, st in enumerate(body)
+                    if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+                            and isinstance(st.value.value, str) and not (i == 0 and keep_first))]
+        if len(new_body) != len(body):
+            node.body = new_body or [ast.Pass()]
+
+
+def lambda_only_change(o, n):
+    """If the trees differ only inside lambda bodies, return the old line spans of the lambdas whose
+    body changed (their code runs when called, so line coverage of the body is exact)."""
     try:
-        o, n = ast.parse(old_text), ast.parse(new_text)
         ol = [x for x in ast.walk(o) if isinstance(x, ast.Lambda)]
         nl = [x for x in ast.walk(n) if isinstance(x, ast.Lambda)]
         if not ol or len(ol) != len(nl):
@@ -582,15 +594,15 @@ def lambda_only_change(old_text, new_text):
         changed = [(a.body.lineno, a.body.end_lineno) for a, b in zip(ol, nl) if ast.dump(a.body) != ast.dump(b.body)]
         if not changed:
             return None
-        o2, n2 = ast.parse(old_text), ast.parse(new_text)
-        for t in (o2, n2):
-            for x in ast.walk(t):
-                if isinstance(x, ast.Lambda):
-                    x.body = ast.Constant(value=None)
-        if ast.dump(o2) != ast.dump(n2):
-            return None
-        # nested lambdas: report only outermost changed spans (inner ones are inside them anyway)
-        return changed
+        saved = [(x, x.body) for x in ol + nl]
+        try:
+            for x in ol + nl:
+                x.body = ast.Constant(value=None)
+            same_rest = ast.dump(o) == ast.dump(n)
+        finally:
+            for x, body in saved:
+                x.body = body
+        return changed if same_rest else None
     except Exception:
         return None
 
@@ -599,7 +611,8 @@ def equivalent_modules(old_tree, new_tree, maps):
     try:
         if not maps.enums and not maps.enum_attrs:
             return False
-        return ast.dump(_normalize_identity(ast.parse(old_tree), maps)) ==             ast.dump(_normalize_identity(ast.parse(new_tree), maps))
+        # in place: only Compare operators change, which the later line-based analysis ignores
+        return ast.dump(_normalize_identity(old_tree, maps)) == ast.dump(_normalize_identity(new_tree, maps))
     except Exception:
         return False
 
@@ -631,14 +644,22 @@ def analyze_py(rel, fp, maps, import_checks):
         raise RunAll("deleted python file")
     new_text = apply_patch(old_text, fp)
     try:
-        new_code = compile(new_text, rel, "exec", dont_inherit=True)
+        new_tree = ast.parse(new_text)
+        compile(new_tree, rel, "exec", dont_inherit=True)  # compile-time errors too (reuses the AST)
     except (SyntaxError, ValueError):
         if is_test_file and maps.by_file.get(rel):
             return set(maps.by_file[rel])
         raise RunAll(f"syntax error in {rel}")
     tree = ast.parse(old_text)
-    new_tree = ast.parse(new_text)
-    lam = lambda_only_change(old_text, new_text)
+    # bare string statements that are not docstrings compile to nothing (attribute "docstrings")
+    _drop_bare_strings(tree)
+    _drop_bare_strings(new_tree)
+    old_dump = ast.dump(tree)
+    if old_dump == ast.dump(new_tree):
+        return set()  # only comments / blank lines / formatting changed: same program
+    changed_text = [t for h in fp.hunks for tag, t in h[2] if tag in "+-"]
+    hunk_text = chr(10).join(t for h in fp.hunks for _tag, t in h[2])
+    lam = lambda_only_change(tree, new_tree) if "lambda" in hunk_text else None
     if lam is not None:
         out = set()
         for s_, e_ in lam:
@@ -654,10 +675,7 @@ def analyze_py(rel, fp, maps, import_checks):
             if rel.startswith("sqlglot/"):
                 import_checks.setdefault("__patched__", {})[rel] = new_text
             return out
-    if same_code(compile(old_text, rel, "exec", dont_inherit=True), new_code) or             ast.dump(tree) == ast.dump(new_tree):
-        return set()  # only comments / blank lines / formatting changed: same program
-    changed_text = [t for h in fp.hunks for tag, t in h[2] if tag in "+-"]
-    if any(re.search(r"is|==|!=", t) for t in changed_text) and             equivalent_modules(old_text, new_text, maps):
+    if any(re.search(r"\bis\b|==|!=", t) for t in changed_text) and             equivalent_modules(tree, new_tree, maps):
         _dbg(rel, 0, "equivalent (is/== on None or enum members)")
         return set()
     removed, inserts = changed_positions(fp)
@@ -852,6 +870,8 @@ real_out.flush()
 
 
 _PRISTINE_FAILS: list = []
+_REPLAY_UNTIL = [float("inf")]
+_IMPORT_UNTIL = [float("inf")]
 _DEADLINE = [float("inf")]
 
 
@@ -1040,6 +1060,9 @@ LAZY_OK = [False]
 
 
 def import_check(patched: dict, also: set = frozenset(), maps=None) -> bool:
+    if time.monotonic() > _IMPORT_UNTIL[0]:
+        log("[selector] import check skipped (time budget): treating as failing")
+        return False
     """True if `import sqlglot` and every sqlglot module still import with the patch applied
     (fresh interpreter; patched sources served by an import hook). Modules that fail to import
     unpatched too (optional dependencies) are ignored."""
@@ -1178,6 +1201,7 @@ replay_core._check(src)
 # local CPU seconds recorded per query are ~3x the scorer's; replay only when it is clearly cheaper
 REPLAY_BUDGET_LOCAL_SEC = float(os.environ.get("REPLAY_BUDGET_LOCAL_SEC", "25"))
 TABLE_LOAD_LOCAL_SEC = 0.6
+REPLAY_START_LOCAL_SEC = 2.0
 
 
 GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
@@ -1212,7 +1236,7 @@ def genmem_prune(selected, import_checks, maps):
     for rel, s, e in spans:
         if tnum in maps.lines_tests(rel, range(s, e + 1)):
             return selected
-    if time.monotonic() + 30 > _DEADLINE[0]:
+    if time.monotonic() > _REPLAY_UNTIL[0]:
         return selected
     # candidate dialects from the files involved (patched files and files subclassing their
     # classes): dialects/<d>.py, parsers/<d>.py, generators/<d>.py, ... ; anything else (core
@@ -1286,17 +1310,18 @@ def replay_prune(selected, patched, spans, maps):
                 mode = "full"
             affected.append((q, mode))
             seconds += q["seconds"] if mode == "full" else q.get("plan_seconds", q["seconds"])
-            if q.get("execute"):
+            if mode == "full" and q.get("execute"):
                 tables |= set(q.get("tables", ()))
         est = seconds + TABLE_LOAD_LOCAL_SEC * len(tables)
-        # scorer CPU is ~1/3 of these local seconds, plus ~1 s to start a patched interpreter
+        # conservative cost model (cold per-query timings / 3 + interpreter start): broad replays
+        # mostly end in "diff" and only burn CPU, so replay only when clearly worth it
         if est / 3 + 1.0 > saving_ms / 1000 * 0.7:
             log(f"[selector] replay {kind}: saving {saving_ms / 1000:.1f}s < cost est {est / 3 + 1:.1f}s, keep")
             continue
         if est > REPLAY_BUDGET_LOCAL_SEC:
             log(f"[selector] replay {kind}: {len(affected)} queries, est {est:.1f}s local: too costly, keep")
             continue
-        if time.monotonic() + 30 > _DEADLINE[0]:
+        if time.monotonic() > _REPLAY_UNTIL[0]:
             continue
         if affected and _REPLAY_ENV_BAD:
             continue
@@ -1367,8 +1392,14 @@ def main() -> None:
         maps = None
     out = []
     # the batch limit is 3 min (4.5 in the final); leave a wide margin for the run-all fallbacks
-    deadline = time.monotonic() + float(os.environ.get("SELECTOR_BUDGET_SEC", "140"))
+    start = time.monotonic()
+    # hard limit: past it, commits are answered without any analysis (run everything)
+    deadline = start + float(os.environ.get("SELECTOR_BUDGET_SEC", "150"))
     _DEADLINE[0] = deadline
+    # replays (optional savings) only in the first part of the budget; import checks until
+    # IMPORT_CHECK_UNTIL, after which a commit that needs one runs everything
+    _REPLAY_UNTIL[0] = start + float(os.environ.get("REPLAY_BUDGET_SEC", "60"))
+    _IMPORT_UNTIL[0] = start + float(os.environ.get("IMPORT_CHECK_BUDGET_SEC", "120"))
     for p in patches:
         commit = p.name[: -len(".patch")] if p.name.endswith(".patch") else p.stem
         try:
