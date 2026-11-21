@@ -132,7 +132,8 @@ def run_query(src, kind, meta, sql, tables_cache, mode="full", timing=None):
     from sqlglot.executor.python import PythonExecutor
 
     expression = pickle.loads(pickle.dumps(parse_one(sql)))
-    out = {"duckdb_sql": _h(transpile(sql, write="duckdb")[0])}
+    duck = transpile(sql, write="duckdb")[0]
+    out = {"duckdb_sql": _h(duck), "duckdb_text": duck}
     if meta.get("execute"):
         sch = schema(kind)
         tables = {}
@@ -199,7 +200,9 @@ def _record(kind, i, src):
 
     mon.use_tool_id(tool, "replay")
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    # one-line functions (lambdas) emit no LINE event when called: record their first line
+    mon.register_callback(tool, mon.events.PY_START, lambda code, off: on_line(code, code.co_firstlineno))
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
     sys.path.insert(0, src)
     qs = queries(src, kind)
     meta, sql, _ = qs[i]
@@ -271,6 +274,41 @@ def _genmem(spec):
 
 
 # --------------------------------------------------------------------------- run-time check
+_DUCK = {}
+
+
+def duckdb_same(src, kind, old_sql, new_sql):
+    """The test compares with DuckDB's answer to transpile(sql, write="duckdb"); a different SQL
+    text is harmless if DuckDB returns the same columns and rows for it."""
+    try:
+        import duckdb
+    except Exception:
+        return False
+    conn = _DUCK.get(kind)
+    if conn is None:
+        conn = duckdb.connect()
+        directory = os.path.join(src, "tests", "fixtures", KINDS[kind][0])
+        for table, columns in schema(kind).items():
+            file_name = os.path.join(directory, f"{table}.csv.gz").replace(os.sep, "/")
+            conn.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+            )
+        _DUCK[kind] = conn
+
+    def run(q):
+        cur = conn.execute(q)
+        return [d[0] for d in cur.description], cur.fetchall()
+
+    try:
+        return run(old_sql) == run(new_sql)
+    except Exception:
+        return False
+
+
 def _check(src):
     req = json.loads(sys.stdin.read())
     real_out = sys.stdout
@@ -300,6 +338,8 @@ def _check(src):
                 keys = ("duckdb_sql", "plan") if mode == "plan" else ("duckdb_sql", "plan", "result")
                 for k in keys:
                     if expected.get(k) != got.get(k):
+                        if k == "duckdb_sql" and expected.get("duckdb_text") and                                 duckdb_same(src, kind, expected["duckdb_text"], got["duckdb_text"]):
+                            continue
                         say(f"diff {kind} {i}: {k}")
                         return
         say("same")

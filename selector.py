@@ -569,6 +569,31 @@ def _normalize_identity(tree, maps):
     return t
 
 
+def lambda_only_change(old_text, new_text):
+    """If old and new differ only inside lambda bodies, return the old line spans of the lambdas
+    whose body changed (their code runs when called, so line coverage of the body is exact)."""
+    try:
+        o, n = ast.parse(old_text), ast.parse(new_text)
+        ol = [x for x in ast.walk(o) if isinstance(x, ast.Lambda)]
+        nl = [x for x in ast.walk(n) if isinstance(x, ast.Lambda)]
+        if not ol or len(ol) != len(nl):
+            return None
+        changed = [(a.body.lineno, a.body.end_lineno) for a, b in zip(ol, nl) if ast.dump(a.body) != ast.dump(b.body)]
+        if not changed:
+            return None
+        o2, n2 = ast.parse(old_text), ast.parse(new_text)
+        for t in (o2, n2):
+            for x in ast.walk(t):
+                if isinstance(x, ast.Lambda):
+                    x.body = ast.Constant(value=None)
+        if ast.dump(o2) != ast.dump(n2):
+            return None
+        # nested lambdas: report only outermost changed spans (inner ones are inside them anyway)
+        return changed
+    except Exception:
+        return None
+
+
 def equivalent_modules(old_tree, new_tree, maps):
     try:
         if not maps.enums and not maps.enum_attrs:
@@ -612,6 +637,22 @@ def analyze_py(rel, fp, maps, import_checks):
         raise RunAll(f"syntax error in {rel}")
     tree = ast.parse(old_text)
     new_tree = ast.parse(new_text)
+    lam = lambda_only_change(old_text, new_text)
+    if lam is not None:
+        out = set()
+        for s_, e_ in lam:
+            span = range(s_, e_ + 1)
+            # the line itself also runs at import (that is where the lambda is created), so only
+            # another module's import running it means the body is called at import time
+            if maps.import_mods(rel, span) - {rel}:
+                break
+            out |= maps.lines_tests(rel, span)
+            import_checks.setdefault("__spans__", []).append((rel, s_, e_))
+        else:
+            _dbg(rel, lam[0][0] if lam else 0, f"lambda-body {lam}")
+            if rel.startswith("sqlglot/"):
+                import_checks.setdefault("__patched__", {})[rel] = new_text
+            return out
     if same_code(compile(old_text, rel, "exec", dont_inherit=True), new_code) or             ast.dump(tree) == ast.dump(new_tree):
         return set()  # only comments / blank lines / formatting changed: same program
     changed_text = [t for h in fp.hunks for tag, t in h[2] if tag in "+-"]
@@ -1116,7 +1157,7 @@ GENMEM_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
 def _run_replay_child(req, timeout):
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     try:
-        r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
+        r = subprocess.run([sys.executable, "-I", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
                            input=json.dumps(req), capture_output=True, text=True, encoding="utf-8",
                            env=env, timeout=timeout)
         return next((l for l in r.stdout.splitlines() if l.startswith("@@R ")), "@@R none")
@@ -1218,13 +1259,14 @@ def replay_prune(selected, patched, spans, maps):
             items = []
             if calib is not None:
                 items.append([calib["i"], {"duckdb_sql": calib["duckdb_sql"], "plan": calib["plan"]}, "plan"])
-            items += [[q["i"], {"duckdb_sql": q["duckdb_sql"], "result": q["result"], "plan": q.get("plan")}, mode]
+            items += [[q["i"], {"duckdb_sql": q["duckdb_sql"], "duckdb_text": q.get("duckdb_text"),
+                                "result": q["result"], "plan": q.get("plan")}, mode]
                       for q, mode in affected]
             req = {"patched": [[module_name(r), (SRC / r).as_posix(), t] for r, t in patched.items()],
                    "queries": {kind: items}}
             env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
             try:
-                r = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
+                r = subprocess.run([sys.executable, "-I", "-B", "-c", _REPLAY_CHILD, str(SRC), str(HERE)],
                                    input=json.dumps(req), capture_output=True, text=True, encoding="utf-8",
                                    env=env, timeout=max(5.0, min(60.0, _DEADLINE[0] - time.monotonic() - 10)))
                 verdict = next((l for l in r.stdout.splitlines() if l.startswith("@@R ")), "@@R none")

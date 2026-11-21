@@ -1,6 +1,9 @@
 # Same base image (and digest) the organizers labeled every commit in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 # Pinned sqlglot sources (eb11aec4be8cb2122afe713a4816662c3f0fb2fa, *.py only) used to parse the changed files.
+# DuckDB (same version the organizers labeled with) to re-check the test's DuckDB side when a patch
+# changes the SQL that test_execute_tpch / test_execute_tpcds send to DuckDB.
+RUN pip install --no-cache-dir duckdb==2.0.0
 COPY sqlglot_src.tar.gz /tmp/sqlglot_src.tar.gz
 RUN mkdir -p /opt/sqlglot && tar -xzf /tmp/sqlglot_src.tar.gz -C /opt/sqlglot && rm /tmp/sqlglot_src.tar.gz \
     && python -m compileall -q /opt/sqlglot/sqlglot     && chmod -R a+rX /opt/sqlglot
